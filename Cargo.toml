@@ -1,0 +1,13 @@
+[package]
+name = "printer-installer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "installer"
+path = "src/bin/installer.rs"
+
+[[bin]]
+name = "titech-lpd"
+path = "src/bin/titech-lpd.rs"
