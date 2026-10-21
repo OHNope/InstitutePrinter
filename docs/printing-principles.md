@@ -12,7 +12,7 @@ A normal desktop print setup has three major parts:
 2. The printer driver converts the document into printer-compatible data.
 3. A CUPS backend sends the converted data to the printer.
 
-This project only changes the backend part. It deliberately relies on the already installed Kyocera driver for the PPD and filters.
+This project changes the backend part and ships Kyocera's PPD so that part 2 can be done by the standard CUPS filters, without installing Kyocera's driver software. When that software is installed, the queue uses it instead.
 
 ## Network and protocol
 
@@ -110,22 +110,37 @@ The key changes are:
 
 The multiple-copy behavior avoids relying on the downstream LPD/Kyocera path to interpret the copies field in a way that matches the driver output.
 
-## Role of the Kyocera driver
+## Role of the Kyocera PPD
 
-The Kyocera driver provides the printer description and the filters that produce printer-compatible output.
-
-The PPD describes:
+The Kyocera PPD describes:
 
 - printer model
 - supported paper sizes
 - duplex options
 - color options
 - installable hardware options
-- filter pipeline metadata
+- the exact PJL and PostScript commands for each option
 
-The Kyocera filters, such as `kyofilter_F` and `kyoprefilter_F`, convert CUPS input into the data format expected by the Kyocera ECOSYS P8060cdn.
+The printer understands PostScript (Kyocera calls its interpreter KPDL) directly, so the PPD is all CUPS needs. For a PDF job the CUPS pipeline is:
 
-This project does not implement a print renderer, PostScript converter, PDF converter, or Kyocera protocol encoder. It depends on Kyocera's installed driver stack for that.
+```text
+application/pdf -> cgpdftops (pdftops on Linux) -> pstops -> titech-lpd backend
+```
+
+`pstops` writes the PJL header from the PPD's `*JCLBegin` / `*JCLToPSInterpreter` / JCL options, then the PostScript, inserting the `setpagedevice` code of every selected option.
+
+Kyocera's macOS driver adds two filters to that pipeline through `*cupsPreFilter` / `*cupsFilter` lines in the PPD: `kyoprefilter_F` (PDF to PDF) and `kyofilter_F` (after `pstops`). Comparing their output with the plain CUPS output for the same job shows they only add a few PJL comments and a watermark/overlay macro library, and implement Kyocera-only features such as watermarks, private print with PIN, and user login. Their settings (PIN, login, watermark) are entered in Kyocera's print dialog plugin (`*APDialogExtension`, `KfSummary.plugin`) and the Kyocera Print Panel app; without the plugin the filters produce the same data as plain CUPS.
+
+The installer therefore decides per machine:
+
+- If the filters and the plugin are installed and the filters start on this machine, the PPD is installed unchanged and Kyocera's software handles the extra features.
+- Otherwise it drops those three lines from the queue's copy of the PPD, so none of Kyocera's binaries are needed.
+
+"Start on this machine" matters on Apple Silicon: `kyofilter_F` contains only Intel code and fails with "Bad CPU type" when Rosetta is not installed. The installer runs each filter once without arguments, which makes a CUPS filter exit immediately, to check this.
+
+The bundled PPD itself is kept unmodified in the repository because its license only allows redistribution of the unaltered file.
+
+This project does not implement a print renderer, PostScript converter, PDF converter, or Kyocera protocol encoder. Those are the standard CUPS filters.
 
 ## Role of this project
 
@@ -147,9 +162,9 @@ installer
 `installer` installs and configures the queue. Its responsibilities are:
 
 - check root privileges
-- check that the Kyocera PPD and filters are installed
 - install the embedded `titech-lpd` backend
-- create the CUPS queue with the right URI and PPD
+- detect whether Kyocera's driver software is installed and runnable
+- create the CUPS queue with the right URI and the embedded PPD, minus its Kyocera filter lines when that software is not usable
 - set the assumed Kyocera installable options
 - accept and enable the queue
 

@@ -2,7 +2,7 @@
 
 `printer-installer` builds and installs a CUPS printer queue for the institute Kyocera printer.
 
-The project does not replace the Kyocera printer driver. It uses the Kyocera PPD and filters already installed on the computer, then adds a small custom CUPS backend that forces the LPD user field to your student ID before delegating the actual network upload to the system `lpd` backend.
+The installer is self-contained: Kyocera's driver software does not need to be installed. It embeds Kyocera's own PPD for the ECOSYS P8060cdn, renders jobs with the standard CUPS filters (or with Kyocera's driver software when it is installed), and adds a small custom CUPS backend that forces the LPD user field to your student ID before delegating the actual network upload to the system `lpd` backend.
 
 For the detailed printing and project design notes, see [docs/printing-principles.md](docs/printing-principles.md).
 
@@ -33,36 +33,41 @@ and passes the job to the operating system's built-in LPD backend.
 Install these before building or running the installer:
 
 - Rust toolchain with Cargo.
-- CUPS command line tools such as `lpadmin`, `lpinfo`, `lpstat`, and `cups-config`.
-- Kyocera ECOSYS P8060cdn driver software.
+- CUPS command line tools such as `lpadmin`, `lpstat`, and `cups-config`.
 - Access to the school/internal network that can reach the printer IP address.
 
-The installer checks for the Kyocera ECOSYS P8060cdn KPDL PPD through:
+Kyocera's driver software is optional. See [Bundled Kyocera PPD](#bundled-kyocera-ppd).
 
-```sh
-lpinfo -m
-```
+## Bundled Kyocera PPD
 
-It also checks that the Kyocera filters exist in the CUPS filter directory:
+[assets/Kyocera ECOSYS P8060cdn.PPD](assets/Kyocera%20ECOSYS%20P8060cdn.PPD) is an unmodified copy of the PPD from Kyocera's macOS driver package (`com.kyocera.kyoceraMacintosh.OSX10.pkg` 4.0.7420, PPD `*FileVersion: "8.4506"`). Its header permits redistribution as long as the copyright notice is intact and the file is not altered, so keep it byte-for-byte identical; [.gitattributes](.gitattributes) stops Git from rewriting its CRLF line endings.
 
-```text
-kyofilter_F
-kyoprefilter_F
-```
-
-On macOS this directory is usually:
+The installer embeds it with `include_bytes!`. Three of its lines point CUPS at Kyocera's driver software:
 
 ```text
-/usr/libexec/cups/filter
+*cupsPreFilter: "application/pdf 0 kyoprefilter_F"
+*cupsFilter: "application/vnd.cups-postscript 0 kyofilter_F"
+*APDialogExtension: "/Library/Printers/Kyocera/PDEs/KfSummary.plugin"
 ```
 
-On Linux it is usually:
+The installer checks whether that software is usable:
 
-```text
-/usr/lib/cups/filter
-```
+- every file those lines name exists: the two filters in the CUPS filter directory and the print dialog plugin, and
+- each filter actually starts on this machine. `kyofilter_F` is Intel-only, so on Apple Silicon it needs Rosetta.
 
-The installer asks `cups-config --serverbin` first and only uses platform defaults as a fallback.
+If so, the queue gets the PPD unchanged and works exactly like a queue made by Kyocera's own software, including the Kyocera print dialog features below. Otherwise, for example on a Mac without Kyocera's software, on Apple Silicon without Rosetta, or on Linux, the installer leaves those three lines out and prints the reason. Installing or removing Kyocera's software later takes effect the next time you run the installer.
+
+Without those lines CUPS converts jobs with its own `cgpdftops`/`pdftops` and `pstops` filters, which already emit the PJL header and every PostScript option command written in the PPD (duplex, color mode, paper size, tray, collate, staple, quick copy, ...). The resulting print data is the same as with `kyofilter_F`, apart from Kyocera's watermark/overlay macros.
+
+Features that only Kyocera's filters and print dialog plugin implement are then not available:
+
+- watermark / overlay
+- private print and job box with PIN
+- user login and job accounting via the Kyocera print dialog
+
+To use them, install Kyocera's macOS driver for the ECOSYS P8060cdn and run the installer again. The Kyocera filters and plugin are not bundled: they are Kyocera binaries, macOS-only, and partly Intel-only, and the filters do nothing useful without the plugin.
+
+The Kyocera driver's Linux PPD is not used: its JCL options contain placeholders such as `timestamp=on` that only Kyocera's Linux filter understands, so stock CUPS would send them to the printer as-is.
 
 ## Configure your student ID
 
@@ -203,7 +208,7 @@ Run:
 cargo test
 ```
 
-This checks helper logic such as PPD parsing, CUPS backend path selection, copy handling, and LPD argument rewriting.
+This checks helper logic such as the embedded PPD, Kyocera driver detection and filter removal, CUPS backend path selection, copy handling, and LPD argument rewriting.
 
 ## Install
 
@@ -250,10 +255,10 @@ The installer:
 
 1. Requires root privileges.
 2. Locates the CUPS server binary directory with `cups-config --serverbin`.
-3. Verifies that the Kyocera driver filters are installed.
-4. Finds the Kyocera ECOSYS P8060cdn KPDL PPD from `lpinfo -m`.
-5. Installs the embedded `titech-lpd` backend into the CUPS backend directory.
-6. Recreates the `InstitutePrinter` queue with `lpadmin`.
+3. Checks whether Kyocera's driver software is installed and runnable.
+4. Installs the embedded `titech-lpd` backend into the CUPS backend directory.
+5. Writes the embedded Kyocera PPD to a temporary file, without its Kyocera filter lines unless the Kyocera driver software is usable.
+6. Recreates the `InstitutePrinter` queue with `lpadmin` from that PPD.
 7. Accepts and enables the queue.
 
 The backend is installed as:
@@ -276,7 +281,7 @@ The queue creation command is equivalent to:
 /usr/sbin/lpadmin -x InstitutePrinter
 /usr/sbin/lpadmin -p InstitutePrinter -E \
   -v titech-lpd://172.20.83.212/kyocera \
-  -m "<Kyocera ECOSYS P8060cdn KPDL PPD from lpinfo>" \
+  -P <temporary copy of the embedded PPD, see above> \
   -o Option19=False \
   -o Option26=False \
   -o Option25=False \
@@ -287,8 +292,6 @@ The queue creation command is equivalent to:
 /usr/sbin/cupsaccept InstitutePrinter
 /usr/sbin/cupsenable InstitutePrinter
 ```
-
-The model name is discovered automatically from `lpinfo -m`; it is not hard-coded.
 
 The installable options describe the physical printer hardware assumed by this project:
 

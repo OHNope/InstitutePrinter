@@ -4,17 +4,20 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const PRINTER_NAME: &str = "InstitutePrinter";
 const DEVICE_URI: &str = "titech-lpd://172.20.83.212/kyocera";
 const BACKEND_NAME: &str = "titech-lpd";
 const BACKEND_MODE: u32 = 0o700;
-const PPD_MODEL_MARKER: &str = "Kyocera ECOSYS P8060cdn";
-const PPD_DRIVER_MARKER: &str = "KPDL";
-const OLD_EMBEDDED_PPD_NAME: &str = "Kyocera_ECOSYS_P8060cdn.ppd";
-const REQUIRED_FILTERS: &[&str] = &["kyofilter_F", "kyoprefilter_F"];
+const PPD_DESCRIPTION: &str = "embedded Kyocera ECOSYS P8060cdn (KPDL) PPD";
+const PPD_MODE: u32 = 0o644;
+// Lines that point CUPS at the Kyocera driver software. They are kept only
+// when that software is installed and runnable; otherwise CUPS uses its own
+// pdftops/pstops filters, which already emit every PJL and PostScript option
+// command defined in the PPD.
+const KYOCERA_ONLY_PPD_KEYWORDS: &[&str] = &["*cupsPreFilter", "*cupsFilter", "*APDialogExtension"];
 const INSTALLABLE_OPTIONS: &[(&str, &str)] = &[
     ("Option19", "False"),    // Paper feeders
     ("Option26", "False"),    // Job separator
@@ -26,6 +29,8 @@ const INSTALLABLE_OPTIONS: &[(&str, &str)] = &[
 ];
 
 const EMBEDDED_BACKEND: &[u8] = include_bytes!("../../assets/titech-lpd");
+// Unmodified copy of the PPD shipped in Kyocera's macOS driver package.
+const EMBEDDED_PPD: &[u8] = include_bytes!("../../assets/Kyocera ECOSYS P8060cdn.PPD");
 
 extern "C" {
     fn geteuid() -> u32;
@@ -45,9 +50,13 @@ fn run() -> Result<(), String> {
     let backend_dir = serverbin.join("backend");
     let backend_path = backend_dir.join(BACKEND_NAME);
     let filter_dir = serverbin.join("filter");
-    let ppd_model = find_kyocera_ppd_model()?;
-
-    require_kyocera_filters(&filter_dir)?;
+    let kyocera_driver = check_kyocera_driver(&kyocera_driver_files(EMBEDDED_PPD, &filter_dir));
+    let rendering = match &kyocera_driver {
+        Ok(()) => "Kyocera driver software (filters and print dialog plugin)".to_string(),
+        Err(reason) => {
+            format!("standard CUPS filters (Kyocera driver software not used: {reason})")
+        }
+    };
 
     debug_confirm(&format!("Is your student ID {}?", STUDENT_ID))?;
 
@@ -75,22 +84,33 @@ fn run() -> Result<(), String> {
     }
 
     debug_confirm(&format!(
-        "Create printer queue {PRINTER_NAME} with URI {DEVICE_URI} and model {ppd_model}"
+        "Create printer queue {PRINTER_NAME} with URI {DEVICE_URI}, the {PPD_DESCRIPTION} and {rendering}"
     ))?;
-    let mut create_args = vec![
-        "-p".to_string(),
-        PRINTER_NAME.to_string(),
-        "-E".to_string(),
-        "-v".to_string(),
-        DEVICE_URI.to_string(),
-        "-m".to_string(),
-        ppd_model.clone(),
-    ];
-    for (name, value) in INSTALLABLE_OPTIONS {
-        create_args.push("-o".to_string());
-        create_args.push(format!("{name}={value}"));
-    }
-    run_command_owned(&lpadmin, &create_args)?;
+    let ppd_path = temp_path_next_to(&std::env::temp_dir().join(format!("{PRINTER_NAME}.ppd")));
+    let result = (|| {
+        write_file(
+            &ppd_path,
+            &queue_ppd(EMBEDDED_PPD, kyocera_driver.is_ok()),
+            PPD_MODE,
+        )?;
+
+        let mut create_args = vec![
+            "-p".to_string(),
+            PRINTER_NAME.to_string(),
+            "-E".to_string(),
+            "-v".to_string(),
+            DEVICE_URI.to_string(),
+            "-P".to_string(),
+            path_str(&ppd_path)?.to_string(),
+        ];
+        for (name, value) in INSTALLABLE_OPTIONS {
+            create_args.push("-o".to_string());
+            create_args.push(format!("{name}={value}"));
+        }
+        run_command_owned(&lpadmin, &create_args)
+    })();
+    let _ = fs::remove_file(&ppd_path);
+    result?;
 
     debug_confirm(&format!("Accept jobs for {PRINTER_NAME}"))?;
     run_command(&cupsaccept, &[PRINTER_NAME])?;
@@ -103,7 +123,8 @@ fn run() -> Result<(), String> {
     println!("Backend: {BACKEND_NAME}");
     println!("Device URI: {DEVICE_URI}");
     println!("Fixed LPD user: {STUDENT_ID}");
-    println!("PPD model: {ppd_model}");
+    println!("PPD: {PPD_DESCRIPTION}");
+    println!("Rendering: {rendering}");
 
     Ok(())
 }
@@ -166,61 +187,82 @@ fn default_cups_serverbin() -> PathBuf {
     }
 }
 
-fn require_kyocera_filters(filter_dir: &Path) -> Result<(), String> {
-    let missing: Vec<String> = REQUIRED_FILTERS
+fn is_kyocera_driver_line(line: &[u8]) -> bool {
+    KYOCERA_ONLY_PPD_KEYWORDS
         .iter()
-        .map(|name| filter_dir.join(name))
-        .filter(|path| !path.exists())
-        .map(|path| path.display().to_string())
-        .collect();
+        .any(|keyword| line.starts_with(keyword.as_bytes()))
+}
 
-    if missing.is_empty() {
-        return Ok(());
+// Files the PPD's Kyocera-only lines refer to: filters inside the CUPS filter
+// directory and the print dialog plugin bundle at an absolute path.
+fn kyocera_driver_files(ppd: &[u8], filter_dir: &Path) -> Vec<PathBuf> {
+    String::from_utf8_lossy(ppd)
+        .lines()
+        .filter(|line| is_kyocera_driver_line(line.as_bytes()))
+        .filter_map(|line| {
+            let value = line.split('"').nth(1)?;
+            if line.starts_with("*APDialogExtension") {
+                Some(PathBuf::from(value))
+            } else {
+                value
+                    .split_whitespace()
+                    .last()
+                    .map(|name| filter_dir.join(name))
+            }
+        })
+        .collect()
+}
+
+// Err explains why the Kyocera driver software cannot be used.
+fn check_kyocera_driver(files: &[PathBuf]) -> Result<(), String> {
+    if files.is_empty() {
+        return Err("the PPD references no Kyocera driver files".to_string());
     }
 
-    Err(format!(
-        "Kyocera driver filters are not installed. Missing: {}. Install Kyocera driver software for ECOSYS P8060cdn, then run this installer again.",
-        missing.join(", ")
-    ))
-}
-
-fn find_kyocera_ppd_model() -> Result<String, String> {
-    let lpinfo = command_path("/usr/sbin/lpinfo", "lpinfo");
-    let output = run_command(&lpinfo, &["-m"])?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    parse_ppd_model(&stdout).ok_or_else(|| {
-        format!(
-            "Kyocera ECOSYS P8060cdn KPDL PPD is not installed. Install Kyocera driver software for ECOSYS P8060cdn, then run this installer again."
-        )
-    })
-}
-
-fn parse_ppd_model(lpinfo_output: &str) -> Option<String> {
-    let model_marker = PPD_MODEL_MARKER.to_ascii_lowercase();
-    let driver_marker = PPD_DRIVER_MARKER.to_ascii_lowercase();
-
-    lpinfo_output.lines().find_map(|line| {
-        let lower = line.to_ascii_lowercase();
-        if !lower.contains(&model_marker) || !lower.contains(&driver_marker) {
-            return None;
-        }
-        if lower.contains(&OLD_EMBEDDED_PPD_NAME.to_ascii_lowercase()) {
-            return None;
+    for path in files {
+        if !path.exists() {
+            return Err(format!("{} is not installed", path.display()));
         }
 
-        ppd_model_name(line)
-    })
-}
-
-fn ppd_model_name(line: &str) -> Option<String> {
-    for suffix in [".PPD", ".ppd"] {
-        if let Some(index) = line.find(suffix) {
-            return Some(line[..index + suffix.len()].to_string());
+        // Started without arguments, a CUPS filter exits immediately. Failing
+        // to start means this machine cannot run it, e.g. an Intel-only filter
+        // on Apple Silicon without Rosetta. A file the kernel cannot execute at
+        // all is retried through /bin/sh, which then exits with 126 or 127.
+        if path.is_file() {
+            let status = Command::new(path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map_err(|e| format!("{} cannot run on this machine: {e}", path.display()))?;
+            if matches!(status.code(), Some(126 | 127)) {
+                return Err(format!(
+                    "{} cannot run on this machine: not an executable for this system",
+                    path.display()
+                ));
+            }
         }
     }
 
-    line.split_whitespace().next().map(str::to_string)
+    Ok(())
+}
+
+fn queue_ppd(ppd: &[u8], use_kyocera_driver: bool) -> Vec<u8> {
+    if use_kyocera_driver {
+        return ppd.to_vec();
+    }
+
+    ppd.split_inclusive(|&byte| byte == b'\n')
+        .filter(|line| !is_kyocera_driver_line(line))
+        .flatten()
+        .copied()
+        .collect()
+}
+
+fn write_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+    fs::write(path, bytes).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .map_err(|e| format!("failed to chmod {:o} {}: {e}", mode, path.display()))
 }
 
 fn install_file_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
@@ -377,36 +419,83 @@ mod tests {
     }
 
     #[test]
-    fn parse_ppd_model_finds_kyocera_kpdl_entry() {
-        let lpinfo_output = "\
-drv:///sample.drv/generic.ppd Generic PostScript Printer
-Library/Printers/PPDs/Contents/Resources/Kyocera ECOSYS P8060cdn.PPD Kyocera ECOSYS P8060cdn (KPDL)
-";
+    fn queue_ppd_drops_kyocera_driver_references() {
+        let ppd = b"*NickName: \"Test\"\r\n\
+*cupsPreFilter: \"application/pdf 0 kyoprefilter_F\"\r\n\
+*cupsFilter: \"application/vnd.cups-postscript 0 kyofilter_F\"\r\n\
+*APDialogExtension: \"/Library/Printers/Kyocera/PDEs/KfSummary.plugin\"\r\n\
+*Duplex None/None: \"statusdict begin false setduplexmode false settumble end\"\r\n";
 
+        assert_eq!(queue_ppd(ppd, true), ppd.to_vec());
         assert_eq!(
-            parse_ppd_model(lpinfo_output),
-            Some(
-                "Library/Printers/PPDs/Contents/Resources/Kyocera ECOSYS P8060cdn.PPD".to_string()
-            )
+            queue_ppd(ppd, false),
+            b"*NickName: \"Test\"\r\n\
+*Duplex None/None: \"statusdict begin false setduplexmode false settumble end\"\r\n"
+                .to_vec()
         );
     }
 
     #[test]
-    fn parse_ppd_model_ignores_non_kpdl_entries() {
-        let lpinfo_output = "\
-drv:///sample.drv/generpcl.ppd Generic PCL Laser Printer
-Library/Printers/PPDs/Contents/Resources/Kyocera ECOSYS P8060cdn.PPD Kyocera ECOSYS P8060cdn
-";
+    fn embedded_ppd_needs_no_kyocera_software() {
+        let ppd = String::from_utf8_lossy(EMBEDDED_PPD);
+        assert!(ppd.contains("*NickName: \"Kyocera ECOSYS P8060cdn (KPDL)\""));
+        assert!(ppd.contains("kyofilter_F"));
 
-        assert_eq!(parse_ppd_model(lpinfo_output), None);
+        let queue = String::from_utf8_lossy(&queue_ppd(EMBEDDED_PPD, false)).into_owned();
+        assert!(!queue.contains("kyofilter_F"));
+        assert!(!queue.contains("kyoprefilter_F"));
+        assert!(!queue.contains("/Library/Printers/Kyocera"));
     }
 
     #[test]
-    fn parse_ppd_model_ignores_old_embedded_ppd() {
-        let lpinfo_output = "\
-Library/Printers/PPDs/Contents/Resources/Kyocera_ECOSYS_P8060cdn.ppd Kyocera ECOSYS P8060cdn KPDL
-";
+    fn kyocera_driver_files_lists_filters_and_plugin() {
+        assert_eq!(
+            kyocera_driver_files(EMBEDDED_PPD, Path::new("/cups/filter")),
+            vec![
+                PathBuf::from("/cups/filter/kyoprefilter_F"),
+                PathBuf::from("/cups/filter/kyofilter_F"),
+                PathBuf::from("/Library/Printers/Kyocera/PDEs/KfSummary.plugin"),
+            ]
+        );
+    }
 
-        assert_eq!(parse_ppd_model(lpinfo_output), None);
+    #[test]
+    fn check_kyocera_driver_requires_installed_runnable_files() {
+        let dir = std::env::temp_dir().join(format!("installer-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("Driver.plugin")).unwrap();
+        write_file(&dir.join("filter"), b"#!/bin/sh\nexit 255\n", 0o755).unwrap();
+        write_file(
+            &dir.join("foreign"),
+            b"\xcf\xfa\xed\xfe not runnable",
+            0o755,
+        )
+        .unwrap();
+
+        let installed = vec![dir.join("filter"), dir.join("Driver.plugin")];
+        let missing = vec![dir.join("filter"), dir.join("Missing.plugin")];
+        let foreign = vec![dir.join("foreign"), dir.join("Driver.plugin")];
+
+        assert_eq!(check_kyocera_driver(&installed), Ok(()));
+        assert!(check_kyocera_driver(&missing)
+            .unwrap_err()
+            .contains("is not installed"));
+        assert!(check_kyocera_driver(&foreign)
+            .unwrap_err()
+            .contains("cannot run on this machine"));
+        assert!(check_kyocera_driver(&[]).is_err());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn installable_options_exist_in_embedded_ppd() {
+        let ppd = String::from_utf8_lossy(EMBEDDED_PPD);
+        for (name, value) in INSTALLABLE_OPTIONS {
+            assert!(
+                ppd.contains(&format!("*{name} {value}/")),
+                "missing *{name} {value}"
+            );
+        }
     }
 }
