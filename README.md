@@ -6,6 +6,17 @@ The installer is self-contained: Kyocera's driver software does not need to be i
 
 For the detailed printing and project design notes, see [docs/printing-principles.md](docs/printing-principles.md).
 
+## Two versions
+
+This repository has two independent versions on separate branches:
+
+| Branch | What it is | Platforms |
+|---|---|---|
+| `master` (this branch) | A CUPS printer queue `InstitutePrinter` with Kyocera's PPD. Every application can print to it from its normal print dialog, with all printer options. | macOS, Linux |
+| [`cross-platform`](https://github.com/OHNope/InstitutePrinter/tree/cross-platform) | The driver-free `institute-print` tool: it uploads PDF and PostScript files directly, with no driver, queue or administrator step. On macOS it adds an item to the PDF menu of the print dialog. | Windows, macOS, Linux |
+
+They share no files and can be installed side by side. This version installs the `InstitutePrinter` queue and the `titech-lpd` CUPS backend in system folders. The `cross-platform` version installs `institute-print` and, on macOS, `~/Library/PDF Services/Send to Institute Printer.app` in your home folder. Clone each branch into its own folder, since each keeps your student ID in its own local `src/config.rs`.
+
 ## What this project installs
 
 The installer creates a CUPS printer queue named:
