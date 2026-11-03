@@ -2,9 +2,24 @@
 
 `institute-print` sends PDF and PostScript files straight to the institute Kyocera printer (ECOSYS P8060cdn) over LPD, with your student ID as the LPD user.
 
-There is no printer driver, no print queue, no installer and no administrator step. The printer renders PDF (PDF Direct Print) and PostScript (KPDL3) itself, so the tool only wraps the file in a short PJL header and uploads it. The same code runs on Windows, macOS and Linux.
+There is no printer driver, no print queue, no installer and no administrator step. The printer renders PDF (PDF Direct Print) and PostScript (KPDL3) itself, so the tool only wraps the file in a short PJL header and uploads it. The same code runs on Windows, macOS and Linux. On macOS it can also be added to the PDF menu of the print dialog.
 
 For how the printing works and why no driver is needed, see [docs/printing-principles.md](docs/printing-principles.md).
+
+## Two versions
+
+This repository has two independent versions on separate branches:
+
+| Branch | What it is | Platforms |
+|---|---|---|
+| [`master`](https://github.com/OHNope/InstitutePrinter/tree/master) | A CUPS printer queue `InstitutePrinter` with Kyocera's PPD. Every application can print to it from its normal print dialog, with all printer options. | macOS, Linux |
+| `cross-platform` (this branch) | The driver-free `institute-print` tool. | Windows, macOS, Linux |
+
+They share no files and can be installed side by side. The `master` version installs the `InstitutePrinter` queue and the `titech-lpd` CUPS backend in system folders. This version installs `institute-print` and, on macOS, `~/Library/PDF Services/Send to Institute Printer.app` in your home folder. Clone each branch into its own folder, since each keeps your student ID in its own local `src/config.rs`:
+
+```sh
+git clone -b cross-platform https://github.com/OHNope/InstitutePrinter.git InstitutePrinter-cross-platform
+```
 
 ## Requirements
 
@@ -31,7 +46,7 @@ The printer address and LPD queue (`lpd://172.20.83.212/kyocera`) are in the sam
 cargo build --release
 ```
 
-The binary is `target/release/institute-print` (`institute-print.exe` on Windows). Copy it anywhere on your `PATH`; it needs no other files.
+The binary is `target/release/institute-print` (`institute-print.exe` on Windows). Copy it anywhere on your `PATH`; it needs no other files. Alternatively, `cargo install --path . --locked` builds it and puts it in `~/.cargo/bin`.
 
 ## Print
 
@@ -53,14 +68,30 @@ Options:
 
 Options you leave out are not sent, so the printer's own defaults apply.
 
-Only PDF and PostScript files are accepted. To print from another application, save or export the document as PDF first (on Windows, "Microsoft Print to PDF" works for any application).
+Only PDF and PostScript files are accepted. To print from another application on macOS, use the [print dialog item](#print-from-the-macos-print-dialog). On Windows and Linux, save or export the document as PDF first (on Windows, "Microsoft Print to PDF" works for any application).
 
 All files are checked before anything is sent; the tool then uploads them in order and stops at the first failure.
 
+## Print from the macOS print dialog
+
+[macos/send-to-institute-printer.applescript](macos/send-to-institute-printer.applescript) is a small app for the PDF menu at the bottom left of the print dialog. Install `institute-print` first, in `~/.cargo/bin`, `/opt/homebrew/bin` or `/usr/local/bin`, then:
+
+```sh
+mkdir -p ~/Library/"PDF Services"
+osacompile -o ~/Library/"PDF Services/Send to Institute Printer.app" macos/send-to-institute-printer.applescript
+```
+
+In any application, choose File > Print, open the PDF menu and choose **Send to Institute Printer**. The document is sent right away with the printer's default settings; choices made in the print dialog, such as copies or duplex, are not used. A notification confirms the upload, and an alert shows any error.
+
+To remove it, delete `~/Library/PDF Services/Send to Institute Printer.app`.
+
+Windows and Linux have no print dialog menu like this. There, save the document as PDF and run `institute-print` on it.
+
 ## Verify on the real printer
 
-Two parts can only be confirmed by printing on the institute printer:
+Three parts can only be confirmed on a real setup:
 
+- Since macOS 11 the print dialog runs PDF menu items in a sandbox, and some kinds of items stopped working. Apps like this one are reported to still work, but check that **Send to Institute Printer** shows a notification or an error alert, not nothing.
 - `--duplex`, `--mono` and `--color` use the standard HP PJL variables `DUPLEX`, `BINDING` and `RENDERMODE`. Kyocera's PPD for this printer does not list them (it sets duplex and color with PostScript code), so check one test page with each option. If one has no effect, leave it out and the printer default applies.
 - PDF files are sent with `@PJL ENTER LANGUAGE=PDF`. If a PDF prints as garbage or an error page, report it together with the `--dry-run` output.
 

@@ -82,11 +82,11 @@ A port that was just used stays in TIME_WAIT for a while; the tool then simply m
 
 ## Why there is no driver or print queue
 
-An earlier version of this project installed a CUPS queue with Kyocera's PPD and a custom CUPS backend that rewrote the LPD user field. That only worked on macOS and Linux, needed root, and had no counterpart on Windows: Windows would have needed a signed driver package for the PPD plus either a port monitor DLL inside the spooler or a background relay service, because its built-in LPR port always sends the Windows account name.
+The `master` branch of this repository installs a CUPS queue with Kyocera's PPD and a custom CUPS backend that rewrites the LPD user field. That works on macOS and Linux and needs root to install. It has no counterpart on Windows: Windows would need a signed driver package for the PPD plus either a port monitor DLL inside the spooler or a background relay service, because its built-in LPR port always sends the Windows account name.
 
-Since the printer renders PDF and PostScript itself, the driver part was never doing essential work. Uploading the file directly gives one small program that behaves the same on every operating system and needs no installation.
+Since the printer renders PDF and PostScript itself, the driver part does no essential work. Uploading the file directly gives one small program that behaves the same on every operating system and needs no installation. The two versions install different files and can be used side by side.
 
-The trade-off is that applications cannot print to the institute printer from their own print dialog. Documents are exported to PDF first and then sent with `institute-print`.
+The trade-off is that the institute printer does not appear in the print dialog's printer list, and print dialog options are not available. On macOS the PDF menu of the print dialog covers most of this: the print system can hand the document as a PDF to an app in `~/Library/PDF Services`, and `Send to Institute Printer.app` passes it to `institute-print`. Since macOS 11 that menu runs in a sandbox that blocks shell scripts and Automator print plug-ins, so the item is a compiled AppleScript app, which receives the PDF as an ordinary open-document event. On Windows and Linux, documents are exported to PDF first and then sent with `institute-print`.
 
 Kyocera-only features that need Kyocera's driver software (watermarks, private print with PIN, job accounting login in the print dialog) are not available.
 
