@@ -81,7 +81,7 @@ mkdir -p ~/Library/"PDF Services"
 osacompile -o ~/Library/"PDF Services/Send to Institute Printer.app" macos/send-to-institute-printer.applescript
 ```
 
-In any application, choose File > Print, open the PDF menu and choose **Send to Institute Printer**. The document is sent right away with the printer's default settings; choices made in the print dialog, such as copies or duplex, are not used. A notification confirms the upload, and an alert shows any error.
+In any application, choose File > Print, open the PDF menu and choose **Send to Institute Printer**. The document is sent right away with the printer's default settings; choices made in the print dialog, such as copies or duplex, are not used. A notification confirms the upload, and an alert shows any error. Tested on macOS 15 (Sequoia).
 
 To remove it, delete `~/Library/PDF Services/Send to Institute Printer.app`.
 
@@ -89,9 +89,8 @@ Windows and Linux have no print dialog menu like this. There, save the document 
 
 ## Verify on the real printer
 
-Three parts can only be confirmed on a real setup:
+Two parts can only be confirmed by printing on the institute printer:
 
-- Since macOS 11 the print dialog runs PDF menu items in a sandbox, and some kinds of items stopped working. Apps like this one are reported to still work, but check that **Send to Institute Printer** shows a notification or an error alert, not nothing.
 - `--duplex`, `--mono` and `--color` use the standard HP PJL variables `DUPLEX`, `BINDING` and `RENDERMODE`. Kyocera's PPD for this printer does not list them (it sets duplex and color with PostScript code), so check one test page with each option. If one has no effect, leave it out and the printer default applies.
 - PDF files are sent with `@PJL ENTER LANGUAGE=PDF`. If a PDF prints as garbage or an error page, report it together with the `--dry-run` output.
 
