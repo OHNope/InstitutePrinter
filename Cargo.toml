@@ -1,13 +1,12 @@
 [package]
-name = "printer-installer"
-version = "0.1.0"
+name = "institute-printer"
+version = "0.2.0"
 edition = "2021"
 publish = false
 
 [[bin]]
-name = "installer"
-path = "src/bin/installer.rs"
+name = "institute-print"
+path = "src/main.rs"
 
-[[bin]]
-name = "titech-lpd"
-path = "src/bin/titech-lpd.rs"
+[dependencies]
+socket2 = "0.6.5"

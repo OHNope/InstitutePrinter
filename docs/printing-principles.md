@@ -1,241 +1,95 @@
 # Printing Principles and Project Design
 
-This document explains how the school printer setup works and how this project fits into it.
+This document explains how the school printer is reached and why this project needs no printer driver.
 
 ## High-level model
 
-The printer is reached over the school internal network by IP address. Jobs are sent with the LPD protocol. The printer or print server expects the LPD user field to contain a student ID, and that field is used as the user identity for the print job.
+The printer is reached over the school internal network by IP address, and jobs are sent with the LPD protocol (RFC 1179). The printer or print server uses the LPD user field of each job as the user identity, and expects it to be a student ID.
 
-A normal desktop print setup has three major parts:
+A normal desktop print setup has three parts:
 
-1. CUPS accepts a print job from applications.
-2. The printer driver converts the document into printer-compatible data.
-3. A CUPS backend sends the converted data to the printer.
+1. The operating system's print system (CUPS on macOS/Linux, the spooler on Windows) accepts a job from an application.
+2. A printer driver converts the document into data the printer understands.
+3. A backend or port monitor sends that data to the printer, filling in the LPD user field with the local account name.
 
-This project changes the backend part and ships Kyocera's PPD so that part 2 can be done by the standard CUPS filters, without installing Kyocera's driver software. When that software is installed, the queue uses it instead.
+This project skips all three. The ECOSYS P8060cdn interprets PDF (Kyocera's PDF Direct Print) and PostScript (KPDL3) itself, so a PDF or PostScript file already is printer data. `institute-print` reads the file, wraps it in a short PJL header, and uploads it with its own LPD client, putting the student ID in the user field.
 
 ## Network and protocol
 
-The configured printer endpoint is:
-
-```text
-172.20.83.212
-```
-
-The queue name used by the LPD endpoint is:
-
-```text
-kyocera
-```
-
-In LPD URI form, the real destination is:
+The endpoint is:
 
 ```text
 lpd://172.20.83.212/kyocera
 ```
 
-The `/kyocera` part is important. In LPD terminology it is the remote queue name. If you omit it or use the wrong value, the printer server may reject the job or route it incorrectly.
+`kyocera` is the LPD remote queue name. If it is omitted or wrong, the server may reject the job or route it incorrectly. Both values are in `src/config.rs`.
 
-This project installs the CUPS queue with a custom scheme:
+For each upload the tool opens one TCP connection to port 515 and sends, in this order (the default order of the CUPS `lpd` backend):
+
+1. `\x02kyocera\n`: receive a job for queue `kyocera`.
+2. The control file.
+3. The data file.
+
+The server acknowledges each step with a zero byte; anything else is reported as a rejection.
+
+The control file looks like this:
 
 ```text
-titech-lpd://172.20.83.212/kyocera
+H<host name>
+P<student ID>
+J<file name>
+ldfA<nnn><host>
+UdfA<nnn><host>
+N<file name>
 ```
 
-CUPS uses the URI scheme to choose a backend executable. Because the scheme is `titech-lpd`, CUPS runs the custom `titech-lpd` backend installed by this project.
-
-The backend then rewrites the URI scheme back to standard LPD:
-
-```text
-lpd://172.20.83.212/kyocera
-```
-
-and delegates transmission to the operating system's built-in `lpd` CUPS backend.
+`P` is the user field. `l` prints the data file as-is, without any server-side filtering. Host and file names are reduced to printable ASCII and cut to the RFC 1179 length limits; `<nnn>` is a three-digit job number.
 
 ## Why the student ID matters
 
-LPD jobs contain a control file. One field in that control file is the user name, commonly known as the `P` field.
+Many clients fill the LPD user field from the local account name, for example `alice`. The school printer associates the job with the student account named in that field, so a wrong value means the job is not credited to you or is rejected. This project always sends the configured `STUDENT_ID`.
 
-Many CUPS clients fill this field from the local operating system account name. For example, if the local account is `alice`, the LPD user field may become `alice`.
+## Print data and PJL
 
-For this school printer setup, the expected value is the student ID. If the user field is wrong, the job may not be associated with the correct student account.
-
-This project solves that by ignoring the CUPS-provided user argument and always sending the configured `STUDENT_ID` to the system LPD backend.
-
-## How CUPS backends are invoked
-
-CUPS backends are executable files in the CUPS backend directory, usually:
+The data file is the original file between a PJL header and footer:
 
 ```text
-/usr/libexec/cups/backend
+<ESC>%-12345X@PJL JOB
+@PJL SET DUPLEX=ON              (only with --duplex long/short)
+@PJL SET BINDING=LONGEDGE       (LONGEDGE or SHORTEDGE)
+@PJL SET RENDERMODE=GRAYSCALE   (only with --mono / --color: GRAYSCALE or COLOR)
+@PJL ENTER LANGUAGE=PDF         (or POSTSCRIPT)
+<file contents>
+<ESC>%-12345X@PJL EOJ
+<ESC>%-12345X
 ```
 
-on macOS, or:
+The job start, language switch and job end strings come from Kyocera's PPD for this printer (`*JCLBegin`, `*JCLToPSInterpreter`, `*JCLEnd`).
 
-```text
-/usr/lib/cups/backend
-```
+The PPD sets duplex and color mode with PostScript `setpagedevice` code. A PDF file is not PostScript, so that code cannot be used for PDF Direct Print. The tool uses the standard HP PJL variables `DUPLEX`, `BINDING` and `RENDERMODE` instead. They are not listed in the PPD and still need to be confirmed on the real printer. Settings the user does not ask for are not sent, so the printer's own defaults apply.
 
-on Linux.
+The file type is detected from its first bytes: `%PDF-` for PDF, `%!` for PostScript. Anything else is rejected with a hint to export it to PDF.
 
-When a queue uses a URI such as:
+## Copies
 
-```text
-titech-lpd://172.20.83.212/kyocera
-```
+Each copy is a separate upload of the file, with its own job number. This keeps the behavior of the earlier CUPS backend: the printer never has to interpret a copy count, and every copy is a normal one-copy job for the server.
 
-CUPS looks for a backend named:
+## Source port
 
-```text
-titech-lpd
-```
+RFC 1179 asks clients to send from a port below 1024, and some servers enforce it. The CUPS `lpd` backend did this by running as root and taking the first free port counting down from 1023. `institute-print` does the same. Windows and macOS let normal users bind these ports. Linux requires root or `CAP_NET_BIND_SERVICE`, so on Linux the tool warns and falls back to an ordinary port.
 
-and runs it with the standard backend arguments:
+A port that was just used stays in TIME_WAIT for a while; the tool then simply moves on to the next port.
 
-```text
-job-id user title copies options [file]
-```
+## Why there is no driver or print queue
 
-This project's backend builds a new argument list for the system `lpd` backend:
+An earlier version of this project installed a CUPS queue with Kyocera's PPD and a custom CUPS backend that rewrote the LPD user field. That only worked on macOS and Linux, needed root, and had no counterpart on Windows: Windows would have needed a signed driver package for the PPD plus either a port monitor DLL inside the spooler or a background relay service, because its built-in LPR port always sends the Windows account name.
 
-```text
-job-id STUDENT_ID title 1 options [file]
-```
+Since the printer renders PDF and PostScript itself, the driver part was never doing essential work. Uploading the file directly gives one small program that behaves the same on every operating system and needs no installation.
 
-The key changes are:
+The trade-off is that applications cannot print to the institute printer from their own print dialog. Documents are exported to PDF first and then sent with `institute-print`.
 
-- `user` is replaced by `STUDENT_ID`.
-- `copies` is forced to `1`.
-- If multiple copies are requested, the backend sends the job multiple times.
-
-The multiple-copy behavior avoids relying on the downstream LPD/Kyocera path to interpret the copies field in a way that matches the driver output.
-
-## Role of the Kyocera PPD
-
-The Kyocera PPD describes:
-
-- printer model
-- supported paper sizes
-- duplex options
-- color options
-- installable hardware options
-- the exact PJL and PostScript commands for each option
-
-The printer understands PostScript (Kyocera calls its interpreter KPDL) directly, so the PPD is all CUPS needs. For a PDF job the CUPS pipeline is:
-
-```text
-application/pdf -> cgpdftops (pdftops on Linux) -> pstops -> titech-lpd backend
-```
-
-`pstops` writes the PJL header from the PPD's `*JCLBegin` / `*JCLToPSInterpreter` / JCL options, then the PostScript, inserting the `setpagedevice` code of every selected option.
-
-Kyocera's macOS driver adds two filters to that pipeline through `*cupsPreFilter` / `*cupsFilter` lines in the PPD: `kyoprefilter_F` (PDF to PDF) and `kyofilter_F` (after `pstops`). Comparing their output with the plain CUPS output for the same job shows they only add a few PJL comments and a watermark/overlay macro library, and implement Kyocera-only features such as watermarks, private print with PIN, and user login. Their settings (PIN, login, watermark) are entered in Kyocera's print dialog plugin (`*APDialogExtension`, `KfSummary.plugin`) and the Kyocera Print Panel app; without the plugin the filters produce the same data as plain CUPS.
-
-The installer therefore decides per machine:
-
-- If the filters and the plugin are installed and the filters start on this machine, the PPD is installed unchanged and Kyocera's software handles the extra features.
-- Otherwise it drops those three lines from the queue's copy of the PPD, so none of Kyocera's binaries are needed.
-
-"Start on this machine" matters on Apple Silicon: `kyofilter_F` contains only Intel code and fails with "Bad CPU type" when Rosetta is not installed. The installer runs each filter once without arguments, which makes a CUPS filter exit immediately, to check this.
-
-The bundled PPD itself is kept unmodified in the repository because its license only allows redistribution of the unaltered file.
-
-This project does not implement a print renderer, PostScript converter, PDF converter, or Kyocera protocol encoder. Those are the standard CUPS filters.
-
-## Role of this project
-
-This project provides two binaries:
-
-```text
-titech-lpd
-installer
-```
-
-`titech-lpd` is the CUPS backend. Its responsibilities are intentionally small:
-
-- advertise itself to CUPS when run without job arguments
-- accept CUPS backend job arguments
-- convert `titech-lpd://...` to `lpd://...`
-- replace the user field with `STUDENT_ID`
-- delegate the actual upload to the system `lpd` backend
-
-`installer` installs and configures the queue. Its responsibilities are:
-
-- check root privileges
-- install the embedded `titech-lpd` backend
-- detect whether Kyocera's driver software is installed and runnable
-- create the CUPS queue with the right URI and the embedded PPD, minus its Kyocera filter lines when that software is not usable
-- set the assumed Kyocera installable options
-- accept and enable the queue
-
-## Why the installer embeds the backend
-
-The installer embeds the backend binary as bytes:
-
-```rust
-include_bytes!("../../assets/titech-lpd")
-```
-
-The build script first builds `titech-lpd`, copies it to `assets/titech-lpd`, and then builds `installer`.
-
-This makes the installer self-contained: when you run the installer, it already contains the backend that it needs to place into the CUPS backend directory.
-
-Because the backend is embedded as a native executable, the backend and installer must be built for the target machine architecture. For example, an Apple Silicon installer should embed an Apple Silicon backend.
-
-## Printer queue details
-
-The installed queue is named:
-
-```text
-InstitutePrinter
-```
-
-The queue URI is:
-
-```text
-titech-lpd://172.20.83.212/kyocera
-```
-
-The `kyocera` queue name is part of the protocol address. When configuring the printer manually with normal LPD, the equivalent address is:
-
-```text
-lpd://172.20.83.212/kyocera
-```
-
-Some printer setup dialogs split this into separate fields:
-
-- protocol: LPD
-- address or host: `172.20.83.212`
-- queue: `kyocera`
-
-If the dialog has a queue field, enter `kyocera`. If the dialog asks for a URI, use the full `lpd://172.20.83.212/kyocera` form for a normal manual setup, or `titech-lpd://172.20.83.212/kyocera` when using this project's backend.
-
-## Installable options
-
-The installer currently creates the queue with these Kyocera options:
-
-```text
-Option19=False
-Option26=False
-Option25=False
-Option21=False
-Option22=False
-Option17=None
-Option18=HardDisk
-```
-
-These mean the queue assumes no optional feeders, separator, mailbox, punch unit, folding unit, or finisher, while keeping the hard disk enabled.
-
-If the real printer has different optional hardware, those constants should be updated in:
-
-```text
-src/bin/installer.rs
-```
+Kyocera-only features that need Kyocera's driver software (watermarks, private print with PIN, job accounting login in the print dialog) are not available.
 
 ## Security boundary
 
-Embedding a student ID in a local backend is not strong authentication.
-
-It is useful for making the normal print path send the expected LPD user field, but anyone with administrative access to the client machine can bypass it by changing the backend, installing another queue, using a different client, or inspecting the binary.
-
-The security model should be understood as client-side configuration, not as a protected identity mechanism.
+Embedding a student ID in a local binary is not authentication. Anyone on the network can send any LPD user name, and the student ID can be read from the binary. Treat it as client-side configuration, not as a protected identity.

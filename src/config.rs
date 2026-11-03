@@ -1,5 +1,9 @@
 pub const STUDENT_ID: &str = "00B00000"; // Replace with your own student ID before building.
 
+// LPD endpoint of the institute printer: lpd://172.20.83.212/kyocera
+pub const PRINTER_HOST: &str = "172.20.83.212";
+pub const PRINTER_QUEUE: &str = "kyocera";
+
 const _: () = validate_student_id(STUDENT_ID);
 
 const fn validate_student_id(id: &str) {
